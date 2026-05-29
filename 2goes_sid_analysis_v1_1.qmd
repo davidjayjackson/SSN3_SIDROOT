@@ -1,0 +1,470 @@
+---
+title: "GOES / SID Analysis Tools"
+subtitle: "Processing Solar Flare Event Data with Python 3"
+author: "SID Analysis Project"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    code-overflow: scroll
+    highlight-style: github
+    embed-resources: true
+  pdf:
+    toc: true
+    number-sections: true
+    colorlinks: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+This document describes the GOES/SID (Sudden Ionospheric Disturbance) analysis
+toolchain.  The pipeline processes raw solar flare event listings downloaded from
+NOAA/SWPC and correlates them with observer reports submitted to the AAVSO SID
+programme.
+
+The three main scripts run in order:
+
+| Step | Script | Purpose |
+|------|--------|---------|
+| 1 | `1goesevents.py` | Extract FLA and/or XRA events from raw GOES event listings |
+| 2 | `2goesSumm.py` | Summarise daily XRA flare-class counts into a CSV |
+| 3 | `3reporter_main.py` | Correlate observer SID reports with GOES events and generate output reports |
+
+---
+
+## Directory Structure
+
+The scripts expect data to be arranged as follows:
+
+```
+<base_dir>/
+└── MMM_YY/                        ← e.g.  JUN_11
+    ├── eventlistings/
+    │   ├── yyyymmddEvents.txt     ← raw GOES daily event files
+    │   └── ...
+    └── Data Received/
+        ├── MMM_YYXRA.txt          ← output of Step 1 (XRA events)
+        ├── MMM_YYFLA.txt          ← output of Step 1 (FLA events)
+        ├── MMM_YYXRASumm2.csv     ← output of Step 2
+        └── *.dat                  ← observer SID report files
+```
+
+---
+
+## Step 1 — Extract GOES Events (`1goesevents.py`)
+
+### What it does
+
+Reads every `*events.txt` file in the `eventlistings/` sub-directory for the
+chosen month and extracts lines matching the requested event qualifier(s)
+(`XRA`, `FLA`, or both).  Events are sorted chronologically and written to
+`MMM_YYXRA.txt` and/or `MMM_YYFLA.txt` in the `Data Received/` folder.
+
+### Input file format
+
+Each raw GOES event file is named `yyyymmddEvents.txt`.  The relevant fields
+are at fixed column positions:
+
+| Columns (0-indexed) | Content |
+|---------------------|---------|
+| 11–16 | Start time (HHMM) |
+| 17–23 | Maximum time |
+| 27–33 | End time |
+| 43–47 | Event qualifier (`XRA`, `FLA`, …) |
+| 58–64 | Flux / magnitude |
+
+### Usage
+
+```bash
+# Interactive (prompts for month/year and qualifier)
+python 1goesevents.py
+
+# With explicit output base name
+python 1goesevents.py -o ~/data/JUN_11/Data\ Received/JUN_11
+```
+
+### Key functions
+
+```{python}
+#| eval: false
+
+def CopyValidEvents(eventfile: str, code: str) -> list[str]:
+    """
+    Read one daily event file and return lines matching *code* (e.g. 'XRA').
+
+    Each returned line is formatted as:
+        'MM DD     HHMM   HHMM   HHMM   CODE   FLUX'
+    """
+    ...
+
+def ProcessFiles(eventFilePath: str, newFile: str, qualCodes: list[str]) -> None:
+    """
+    Iterate over all event files matching *eventFilePath* glob, collect valid
+    events, sort by date/time, and write one output file per qualifier code.
+    """
+    ...
+```
+
+### Output format
+
+One line per event, blank line between calendar months (normally just one month
+per file):
+
+```
+06 01     0132   0134   0136   XRA    B5.0
+06 01     0612   0615   0618   XRA    C1.2
+06 03     1044   1047   1051   XRA    M2.1
+```
+
+---
+
+## Step 2 — XRA Event Summary (`2goesSumm.py`)
+
+### What it does
+
+Reads the `MMM_YYXRA.txt` file produced in Step 1 and produces a CSV with one
+row per X-ray flare class (A, B, C, M, X, …) and one column per calendar day,
+showing how many events of each class occurred on each day.
+
+### Usage
+
+```bash
+# Interactive
+python 2goesSumm.py
+
+# Explicit output path
+python 2goesSumm.py -o ~/data/JUN_11/Data\ Received/JUN_11XRASumm2.csv
+```
+
+### Configuration
+
+```{python}
+#| label: config
+
+from collections import defaultdict
+from pathlib import Path
+import sys
+
+# ── Hardcoded paths ────────────────────────────────────────────────────────
+BASE_DIR  = Path(r"C:\Users\Owner\Documents\SSN3_SIDROOT")
+DATE_TAG  = "APR_26"                          # MMM_YY
+# ──────────────────────────────────────────────────────────────────────────
+
+DATA_DIR  = BASE_DIR / DATE_TAG / "Data Received"
+XRA_PATH  = DATA_DIR / f"{DATE_TAG}XRA.txt"
+OUT_PATH  = DATA_DIR / f"{DATE_TAG}XRASumm2.csv"
+
+print(f"Input  : {XRA_PATH}")
+print(f"Output : {OUT_PATH}")
+print(f"Input exists: {XRA_PATH.exists()}")
+```
+
+### Read and tally events
+
+```{python}
+#| label: read-events
+#| depends-on: config
+
+DAYS_IN_MONTH = 31
+
+def read_xra_events(xra_path: Path) -> tuple[dict[str, list[int]], int]:
+    """
+    Parse the XRA event file and return a dict mapping each flare-class letter
+    to a 31-element list of daily event counts, plus the highest day seen.
+    """
+    counts: dict[str, list[int]] = defaultdict(lambda: [0] * DAYS_IN_MONTH)
+    last_day = 0
+
+    with xra_path.open("r", encoding="ascii", errors="replace") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            try:
+                day = int(line[3:5])
+            except ValueError:
+                continue
+            if day == 0 or day > DAYS_IN_MONTH:
+                continue
+            if len(line) <= 35:
+                continue
+            flare_class = line[35].upper()
+            if flare_class.isalpha():
+                counts[flare_class][day - 1] += 1
+                last_day = max(last_day, day)
+
+    return dict(counts), last_day
+
+if not XRA_PATH.exists():
+    print(f"ERROR: input file not found:\n  {XRA_PATH}", file=sys.stderr)
+else:
+    counts, last_day = read_xra_events(XRA_PATH)
+    print(f"Flare classes found : {sorted(counts.keys())}")
+    print(f"Last day in file    : {last_day}")
+```
+
+### Write CSV and display results
+
+```{python}
+#| label: write-csv
+#| depends-on: read-events
+
+import pandas as pd
+
+def write_summary(
+    out_path: Path,
+    counts: dict[str, list[int]],
+    last_day: int,
+) -> None:
+    standard = list("ABCMX")
+    extra     = sorted(k for k in counts if k not in standard)
+    ordered   = [c for c in standard if c in counts] + extra
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="ascii") as fh:
+        for cls in ordered:
+            daily  = counts[cls][:last_day]
+            values = ", ".join(f"{v:2d}" for v in daily)
+            fh.write(f"{cls}-Class, {values}\n")
+
+if XRA_PATH.exists():
+    write_summary(OUT_PATH, counts, last_day)
+    print(f"CSV written to:\n  {OUT_PATH}\n")
+
+    # Build a tidy DataFrame for display in the report
+    standard = list("ABCMX")
+    extra     = sorted(k for k in counts if k not in standard)
+    ordered   = [c for c in standard if c in counts] + extra
+
+    df = pd.DataFrame(
+        {cls: counts[cls][:last_day] for cls in ordered},
+        index=pd.RangeIndex(1, last_day + 1, name="Day"),
+    ).T
+    df.index.name = "Class"
+    print(df.to_string())
+```
+
+### Output table
+
+```{python}
+#| label: display-table
+#| depends-on: write-csv
+
+if XRA_PATH.exists():
+    from IPython.display import display
+    display(df.style
+              .set_caption(f"Daily XRA flare counts — {DATE_TAG}")
+              .format("{:d}")
+              .set_table_styles([
+                  {"selector": "caption",
+                   "props": [("font-weight", "bold"), ("font-size", "1.1em")]}
+              ])
+           )
+```
+
+---
+
+## Step 3 — SID Reporter (`3reporter_main.py`)
+
+### What it does
+
+This is the main analysis script.  It:
+
+1. Reads observer `.dat` report files (selected via a file-picker dialog).
+2. Looks up observer metadata (name, location, quality rating) from
+   `SIDAnalObservers.ini`.
+3. Correlates observer-reported SID events with each other (within ±5 minutes)
+   and optionally with GOES XRA/FLA events (within ±15 minutes).
+4. Computes per-observer quality ratios and optionally updates the INI file.
+5. Writes one or more output reports.
+
+### Usage
+
+```bash
+# From the project directory
+python 3reporter_main.py
+
+# With explicit paths
+python 3reporter_main.py \
+    -d ~/data \
+    -o SIDAnalObservers.ini \
+    -s SIDAnalStations.ini
+```
+
+### Correlation algorithm
+
+Event correlation is performed in three passes:
+
+```
+Pass 1 — Observer ↔ Observer  (CorrelateObservers,    window ±5 min)
+Pass 2 — Refine with averages  (CompareObserversToCorrList, ±15 min)
+Pass 3 — Compare to GOES       (CompareToXRAFLA,       window ±15 min)
+```
+
+After correlation, events from high-quality observers (quality ≥ `HiQualLimit`)
+that were not correlated by any other means can be optionally promoted to
+correlated status via `DetectHiQualNonCorrelatedEvents`.
+
+### Data structures
+
+```{python}
+#| eval: false
+
+# Control dictionary — global run parameters
+Control_dict = {
+    "enableXRA":       False,   # include XRA correlation
+    "enableFLA":       False,   # include FLA correlation
+    "enableINIUpdate": False,   # write quality updates back to INI
+    "HiQualLimit":     10,      # min quality to auto-include solo events
+    "path":            "",      # working directory
+    "month":           "",      # 'JUN'
+    "year":            "",      # '11'
+    "nObservers":      0,
+    "nEvents":         0,
+    "nCorr":           0,
+    "nImp":            [],      # count per importance level (0-6)
+}
+
+# Per-event dictionary (inside each observer report)
+event = {
+    "day":       int,   # calendar day
+    "peakTime":  int,   # minutes since midnight (0–1440)
+    "importance": int,  # 0='1-'  1='1'  2='1+'  3='2'  4='2+'  5='3'  6='3+'
+    "duration":  int,   # stop_time - start_time (minutes)
+    "crFlag":    int,   # 0=uncorrelated; USER/XRA/FLA/HIQUAL constant
+    "strEvent":  str,   # original line from the .dat file
+}
+
+# Correlated-event dictionary
+corr_event = {
+    "importance": float,  # average importance across matching events
+    "day":        int,
+    "peak":       float,  # average peak time (minutes)
+    "count":      int,    # number of contributing observations
+    "userID":     str,
+    "crFlag":     int,    # correlation type constant
+}
+```
+
+### Output files
+
+| File | Trigger | Description |
+|------|---------|-------------|
+| `SIDDatabase_MMMYY.txt` | always | Partial database (daytime events only) |
+| `SIDDatabaseFull_MMMYY.txt` | option 2 / `*` | Full database all events |
+| `SIDngdc_MMMYY.txt` | option 1 / `*` | NGDC-format report |
+| `DatabaseFullSumm.csv` | always | Importance-level counts CSV |
+| `SID_Database_Sum.txt` | option 4 / `*` | Analysis summary (partial) |
+| `SID_DatabaseFull_Sum.txt` | option 3 / `*` | Analysis summary (full) |
+| `Observers Summary.txt` | option 5 / `*` | Per-observer unused-event listing |
+
+---
+
+## Configuration Files
+
+### `SIDAnalObservers.ini`
+
+Stores observer metadata across all four INI sections:
+
+```ini
+[NAME]
+A50 = Jerry Winkler
+
+[NGDC NAME]
+A50 = J Winkler
+
+[LOCATION]
+A50 = Houston, TX
+
+[QUALITY RATING]
+A50 = 7
+
+[QUALITY COUNT]
+A50 = 47
+```
+
+Quality rating is a value 0–10 representing the rolling average fraction of
+events that were successfully correlated (`correlated / total × 10`).
+
+### `SIDAnalStations.ini`
+
+Maps VLF station call-signs to frequency strings:
+
+```ini
+[FREQUENCY]
+NAA  = 24.0kHz (NAA)
+NLK  = 24.8kHz (NLK)
+NPM  = 21.4kHz (NPM)
+```
+
+### `SIDAnalControl.ini`
+
+Sets the base data directory and capacity limits:
+
+```ini
+[FILES]
+BaseDirectory = C:\0_SID_Data\
+
+[ALLOCATIONS]
+MaxObservers     = 30
+MaxEvents        = 300
+MaxEventsSEC     = 500
+MaxCorrelations  = 1000
+```
+
+---
+
+## Dependencies
+
+All imports are from the Python standard library — no `pip install` is required.
+
+| Module | Used in | Purpose |
+|--------|---------|---------|
+| `argparse` | all scripts | CLI argument parsing |
+| `collections` | `2goesSumm.py` | `defaultdict` for flare-class tallies |
+| `configparser` | `3reporter_main.py` | Read/write `.ini` files |
+| `os` | all scripts | Path manipulation, directory creation |
+| `pathlib` | `2goesSumm.py` | Modern path handling |
+| `re` | `2goesSumm.py` | (available; reserved for future parsing) |
+| `sys` | all scripts | `sys.exit` on invalid input |
+| `tkinter` | `3reporter_main.py` | File-picker dialog (`GetFiles`) |
+
+::: {.callout-note}
+`tkinter` requires a display (or virtual framebuffer on headless servers).
+On macOS install Python from python.org rather than Homebrew to get a
+`tkinter` build that includes Tk.  On Linux: `sudo apt install python3-tk`.
+:::
+
+---
+
+## Running the Full Pipeline
+
+```bash
+# 1. Extract XRA and FLA events for April 2026
+python 1goesevents.py
+#   > Apr 26
+#   > C:\Users\Owner\Documents\SSN3_SIDROOT
+#   > XRA,FLA
+
+# 2. Summarise XRA events by flare class and day
+#    (this step is run automatically by the Quarto document above)
+python 2goesSumm.py
+#   > Apr 26
+#   > C:\Users\Owner\Documents\SSN3_SIDROOT
+
+# 3. Run the correlation analysis and generate reports
+python 3reporter_main.py -d C:\Users\Owner\Documents\SSN3_SIDROOT
+#   > Apr 26
+#   > Use GOES Data Correlation? y
+#   > Minimum Quality Rating: 10
+#   (file picker opens — select observer .dat files)
+```

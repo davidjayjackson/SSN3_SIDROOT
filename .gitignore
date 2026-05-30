@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+
+# Runtime observation data directories (month-specific run folders)
+APR_*/
+JAN_*/
+FEB_*/
+MAR_*/
+MAY_*/
+JUN_*/
+JUL_*/
+AUG_*/
+SEP_*/
+OCT_*/
+NOV_*/
+DEC_*/
+
+# macOS metadata
+.DS_Store
+
+# R session history
+.Rhistory
+
+# Quarto render cache
+_freeze/
+.quarto/
+
+# Byte-compiled Python
+__pycache__/
+*.pyc

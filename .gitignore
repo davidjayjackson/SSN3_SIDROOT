@@ -25,6 +25,9 @@ DEC_*/
 _freeze/
 .quarto/
 
+# Jupyter checkpoint directories
+.ipynb_checkpoints/
+
 # Byte-compiled Python
 __pycache__/
 *.pyc

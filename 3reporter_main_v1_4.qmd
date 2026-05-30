@@ -250,11 +250,9 @@ def resolve_run_paths(month: str, year: str, base_dir: str) -> dict:
     -------------------------
     <base_dir>/
     └── MMM_YY/                    ← date_dir  (e.g. JUN_11)
-        ├── JUN_11XRA.txt           ← GOES XRA file (looked up from date_dir)
-        ├── JUN_11FLA.txt           ← GOES FLA file (looked up from date_dir)
         ├── Data/                   ← observer .dat files go here
         │   └── *.dat
-        └── Reports/                ← output files written here (created automatically)
+        └── Data Received/          ← XRA/FLA inputs + all output (created automatically)
 
     Parameters
     ----------
@@ -270,7 +268,7 @@ def resolve_run_paths(month: str, year: str, base_dir: str) -> dict:
         base          resolved base directory
         date_dir      <base>/JUN_11
         data_dir      <base>/JUN_11/Data
-        data_received <base>/JUN_11/Reports
+        data_received <base>/JUN_11/Data Received
     """
     mmm = month.upper()
     yy  = year.strip()
@@ -291,7 +289,7 @@ def resolve_run_paths(month: str, year: str, base_dir: str) -> dict:
     date_tag  = f"{mmm}_{yy}"
     date_dir  = os.path.join(base, date_tag)
     data_dir  = os.path.join(date_dir, "Data")
-    data_recv = os.path.join(date_dir, "Reports")
+    data_recv = os.path.join(date_dir, "Data Received")
 
     if not os.path.isdir(date_dir):
         raise FileNotFoundError(
@@ -901,8 +899,9 @@ The GOES XRA and FLA pre-processed files are produced upstream by
 `1goesevents.py`.  Both loaders append a sentinel entry with `day = -1` so
 that `match_xra_fla_event` can break its loop cleanly.
 
-XRA and FLA files are read from `control["date_dir"]` (the `MMM_YY/` folder),
-keeping them separate from the output written to `MMM_YY/Reports/`.
+XRA and FLA files are read from `control["path"]` (the `MMM_YY/Data Received/`
+folder), matching the original script's behaviour where inputs and outputs
+share the same directory.
 
 ### XRA (X-ray)
 
@@ -913,7 +912,7 @@ def read_xra(control: dict) -> list:
     """Load XRA (X-ray) event data from the month's pre-processed file."""
     class_strength = {"A": 1, "B": 10, "C": 100, "M": 1000, "X": 10000}
     filename = os.path.join(
-        control["date_dir"],
+        control["path"],
         f"{control['month']}_{control['year']}XRA.txt",
     )
     xra = []
@@ -937,7 +936,7 @@ def read_xra(control: dict) -> list:
 def read_fla(control: dict) -> list:
     """Load FLA (optical flare) event data from the month's pre-processed file."""
     filename = os.path.join(
-        control["date_dir"],
+        control["path"],
         f"{control['month']}_{control['year']}FLA.txt",
     )
     fla = []
@@ -1258,7 +1257,6 @@ print("SID Reporter — path resolution")
 print("=" * 60)
 print(f"  Period         : {paths['date_tag']}")
 print(f"  Base dir       : {paths['base']}")
-print(f"  Date folder    : {paths['date_dir']}")
 print(f"  Data folder    : {paths['data_dir']}")
 print(f"  Output folder  : {paths['data_received']}")
 print(f"  Observers INI  : {obs_ini}  {'[found]' if os.path.isfile(obs_ini) else '[NOT FOUND]'}")
@@ -1274,7 +1272,6 @@ control = {
     "month":           PARAM_MONTH.upper(),
     "year":            PARAM_YEAR.strip(),
     "path":            paths["data_received"],
-    "date_dir":        paths["date_dir"],
     "enableXRA":       PARAM_ENABLE_XRA,
     "enableFLA":       PARAM_ENABLE_FLA,
     "HiQualLimit":     PARAM_HI_QUAL_LIMIT,
@@ -1361,13 +1358,13 @@ Before rendering, your data directory must look like this:
 C:\Users\Owner\Documents\SSN3_SIDROOT\     ← PARAM_BASE_DIR
 ├── SIDAnalObservers.ini
 ├── SIDAnalStations.ini
-└── JUN_11\                                ← created from PARAM_MONTH + PARAM_YEAR
-    ├── JUN_11XRA.txt                      ← GOES XRA file (from 1goesevents.py)
-    ├── JUN_11FLA.txt                      ← GOES FLA file (from 1goesevents.py)
+└── APR_26\                                ← created from PARAM_MONTH + PARAM_YEAR
     ├── Data\                              ← observer .dat files go here
     │   ├── A050NAA.dat
     │   └── A063NAA.dat
-    └── Reports\                           ← created automatically; output written here
+    └── Data Received\                     ← created automatically; XRA/FLA inputs and output written here
+        ├── APR_26XRA.txt                  ← GOES XRA file (from 1goesevents.py)
+        └── APR_26FLA.txt                  ← GOES FLA file (from 1goesevents.py)
 ```
 
 ### Steps
@@ -1376,7 +1373,7 @@ C:\Users\Owner\Documents\SSN3_SIDROOT\     ← PARAM_BASE_DIR
    at minimum set `PARAM_MONTH`, `PARAM_YEAR`, and `PARAM_BASE_DIR`.
 2. Place observer `.dat` files in the `MMM_YY/Data/` folder.
 3. If using GOES correlation, place the `XRA.txt` and `FLA.txt` files
-   (produced by `1goesevents.py`) in the `MMM_YY/` folder, or
+   (produced by `1goesevents.py`) in the `MMM_YY/Data Received/` folder, or
    set `PARAM_ENABLE_XRA = False` and `PARAM_ENABLE_FLA = False`.
 4. Run one of the commands below.
 
@@ -1391,6 +1388,6 @@ quarto render 3reporter_main_v1_4.qmd --to pdf
 quarto install tinytex
 ```
 
-Output files are written to `<PARAM_BASE_DIR>\<MMM_YY>\Reports\`.
+Output files are written to `<PARAM_BASE_DIR>\<MMM_YY>\Data Received\`.
 The rendered HTML or PDF itself serves as the run log, showing every resolved
 path and a count of events found, correlated, and written.

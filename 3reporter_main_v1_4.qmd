@@ -1,0 +1,1396 @@
+---
+title: "SID Reporter — Sudden Ionospheric Disturbance Analysis"
+author: "AAVSO SID Program"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    highlight-style: github
+  pdf:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    colorlinks: true
+execute:
+  eval: false
+  echo: true
+---
+
+## Overview
+
+This document is the literate-programming form of the SID Reporter tool.
+It processes monthly observer data files submitted to the AAVSO Sudden
+Ionospheric Disturbance (SID) programme, correlates detected ionospheric
+events across observers and against GOES satellite X-ray (XRA) and optical
+flare (FLA) catalogues, and writes a family of output files used for
+archival submission and statistical analysis.
+
+**To run the analysis:** edit the parameters in the
+[Analysis Parameters](#analysis-parameters) section, then render the document
+(`quarto render 3reporter_main_v1_4.qmd`) or execute all cells in order in your
+preferred Jupyter-compatible environment.
+
+The tool is structured in six logical layers, each described and implemented
+in its own section below:
+
+1. Constants and lookup tables
+2. Utility helpers (time conversion, month names, importance labels)
+3. The `Observer` class (metadata + report + event storage)
+4. Correlation and analysis functions
+5. Output generators
+6. Analysis parameters and execution
+
+---
+
+## Analysis Parameters {#analysis-parameters}
+
+**Edit this cell before rendering.**  All other cells define functions and
+constants only — this is the single place that drives a real run.
+
+```{python}
+#| eval: true
+#| code-fold: false
+
+# ── Month and year of the observation period ──────────────────────────────────
+PARAM_MONTH = "APR"   # Three-letter month, any case  (e.g. "Jun", "JUN", "jun")
+PARAM_YEAR  = "26"    # Two-digit year                (e.g. "11" for 2011)
+
+# ── Root directory that CONTAINS the MMM_YY folder ───────────────────────────
+#    This must be the directory whose child is JUN_11 (or whatever MMM_YY is).
+#    Use a full absolute path, e.g. r"C:\Users\Owner\Documents\SSN3_SIDROOT"
+#    Leave as "" to use the directory containing this .qmd file.
+PARAM_BASE_DIR = r"C:\Users\Owner\Documents\SSN3_SIDROOT"
+
+# ── Observer and station INI files ───────────────────────────────────────────
+#    Full paths to the INI files, or "" to look for them inside PARAM_BASE_DIR.
+PARAM_OBSERVERS_INI = ""   # e.g. r"C:\SID\SIDAnalObservers.ini"
+PARAM_STATIONS_INI  = ""   # e.g. r"C:\SID\SIDAnalStations.ini"
+
+# ── GOES secondary correlation ────────────────────────────────────────────────
+PARAM_ENABLE_XRA = True    # Correlate against GOES X-ray catalogue
+PARAM_ENABLE_FLA = True    # Correlate against GOES optical flare catalogue
+
+# ── Observer quality threshold ────────────────────────────────────────────────
+#    Uncorrelated events from observers whose quality rating meets or exceeds
+#    this value are included in the output even without a cross-match.
+#    Range 0-10.  Default 10 (effectively disabled).
+PARAM_HI_QUAL_LIMIT = 10
+
+# ── Update observer quality ratings in the INI after this run ────────────────
+PARAM_UPDATE_INI = False
+
+# ── Additional reports to generate ───────────────────────────────────────────
+#    Include any of: "1", "2", "3", "4", "5", "*"
+#      1 → SIDngdc file          2 → SIDDatabaseFull file
+#      3 → SID_DatabaseFull_Sum  4 → SID_Database_Sum
+#      5 → Observers Summary     * → all of the above
+PARAM_REPORTS = ["1", "2", "5"]
+```
+
+---
+
+## Imports
+
+Standard-library imports only; no third-party dependencies are required.
+
+```{python}
+#| eval: true
+
+import os
+import sys
+import glob
+import configparser
+from functools import cmp_to_key
+```
+
+---
+
+## Constants and Lookup Tables
+
+### Correlation-flag values
+
+Each event carries an integer `crFlag`.  Zero means the event has not yet been
+correlated.  A positive value records *how* the correlation was established:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `FALSE` | 0 | Uncorrelated |
+| `USER_CORRELATED` | 1 | Matched between two or more observers |
+| `XRA_CORRELATED` | 2 | Matched against GOES XRA catalogue |
+| `FLA_CORRELATED` | 3 | Matched against GOES FLA catalogue |
+| `HIQUAL_CORRELATED` | 4 | Included due to observer's high quality rating |
+
+```{python}
+#| eval: true
+
+FALSE = 0
+TRUE  = 1
+
+USER_CORRELATED   = 1
+XRA_CORRELATED    = 2
+FLA_CORRELATED    = 3
+HIQUAL_CORRELATED = 4
+```
+
+### Database output modes
+
+```{python}
+#| eval: true
+
+DB_FULL    = 0   # All correlated events written to output
+DB_PARTIAL = 1   # Only events before 1000 UT included for XRA/FLA correlations
+```
+
+### Default INI filenames
+
+```{python}
+#| eval: true
+
+DEFAULT_OBSERVERS_INI = "SIDAnalObservers.ini"
+DEFAULT_STATION_INI   = "SIDAnalStations.ini"
+```
+
+### Importance mappings
+
+SID event importance is reported as a string such as `1-`, `1`, `1+`, `2`,
+`2+`, `3`, or `3+`.  Internally the programme uses the integers 0–6.
+
+```{python}
+#| eval: true
+
+IMPORTANCE_MAP = {"1-": 0, "1": 1, "1+": 2, "2": 3, "2+": 4, "3": 5, "3+": 6}
+IMP_TO_STR     = {v: k for k, v in IMPORTANCE_MAP.items()}
+```
+
+### Month name and number tables
+
+```{python}
+#| eval: true
+
+MONTH_NAMES = {
+    "jan": "January",  "feb": "February", "mar": "March",
+    "apr": "April",    "may": "May",       "jun": "June",
+    "jul": "July",     "aug": "August",    "sep": "September",
+    "oct": "October",  "nov": "November",  "dec": "December",
+}
+
+MONTH_NUMS = ["jan", "feb", "mar", "apr", "may", "jun",
+              "jul", "aug", "sep", "oct", "nov", "dec"]
+```
+
+---
+
+## Utility Helpers
+
+Small, pure functions used throughout the codebase.
+
+### Time conversion
+
+Event times are stored as four-character HHMM strings in the raw data files.
+Internally all times are represented as **minutes since midnight** (0–1440),
+which makes arithmetic comparisons straightforward.
+
+```{python}
+#| eval: true
+
+def time_ascii_to_int(s: str) -> int:
+    """Convert a four-character HHMM string to minutes since midnight (0–1440)."""
+    if not s.isdigit():
+        return 0
+    return int(s[:2]) * 60 + int(s[2:])
+
+
+def time_int_to_ascii(minutes: int) -> str:
+    """Convert minutes since midnight back to a four-character HHMM string."""
+    return f"{minutes // 60:02d}{minutes % 60:02d}"
+```
+
+### Month and importance formatting
+
+```{python}
+#| eval: true
+
+def month_str(month: str) -> str:
+    """Return the full month name for a three-letter abbreviation."""
+    return MONTH_NAMES[month.lower()]
+
+
+def importance_to_str(n: int) -> str:
+    """Convert a numeric importance level (0–6) to its display string."""
+    return IMP_TO_STR.get(n, "?")
+
+
+def set_date_for_db_file(year: str, month: str, day) -> str:
+    """Return a YYYYMMDD date string for database output files."""
+    mm = f"{MONTH_NUMS.index(month.lower()) + 1:02d}"
+    return f"20{year}{mm}{int(day):02d}"
+```
+
+---
+
+## Directory and File Resolution
+
+These functions replace the interactive prompts from the original script.
+`resolve_run_paths` derives all working paths from the parameters defined
+above; `find_observer_files` globs for `.dat` files in the working directory.
+
+```{python}
+#| eval: true
+
+def resolve_run_paths(month: str, year: str, base_dir: str) -> dict:
+    """
+    Build and return all paths needed for a run.
+
+    Expected directory layout
+    -------------------------
+    <base_dir>/
+    └── MMM_YY/                    ← date_dir  (e.g. JUN_11)
+        ├── JUN_11XRA.txt           ← GOES XRA file (looked up from date_dir)
+        ├── JUN_11FLA.txt           ← GOES FLA file (looked up from date_dir)
+        ├── Data/                   ← observer .dat files go here
+        │   └── *.dat
+        └── Reports/                ← output files written here (created automatically)
+
+    Parameters
+    ----------
+    month    : Three-letter month string, e.g. 'JUN'.
+    year     : Two-digit year string, e.g. '11'.
+    base_dir : Absolute path to the directory that contains the MMM_YY folder.
+               Pass '' to use the directory of this .qmd file.
+
+    Returns
+    -------
+    dict with keys:
+        date_tag      e.g. 'JUN_11'
+        base          resolved base directory
+        date_dir      <base>/JUN_11
+        data_dir      <base>/JUN_11/Data
+        data_received <base>/JUN_11/Reports
+    """
+    mmm = month.upper()
+    yy  = year.strip()
+
+    if len(mmm) != 3 or not mmm.isalpha():
+        raise ValueError(f"Invalid month: {month!r}. Expected three letters, e.g. 'JUN'.")
+    if len(yy) != 2 or not yy.isdigit():
+        raise ValueError(f"Invalid year: {year!r}. Expected two digits, e.g. '11'.")
+
+    if base_dir.strip():
+        base = os.path.expanduser(base_dir)
+    else:
+        # Default: same directory as the .qmd file being rendered.
+        # Quarto sets the working directory to the .qmd location, so
+        # os.getcwd() is reliable here.
+        base = os.getcwd()
+
+    date_tag  = f"{mmm}_{yy}"
+    date_dir  = os.path.join(base, date_tag)
+    data_dir  = os.path.join(date_dir, "Data")
+    data_recv = os.path.join(date_dir, "Reports")
+
+    if not os.path.isdir(date_dir):
+        raise FileNotFoundError(
+            f"Expected data folder not found:\n  {date_dir}\n"
+            f"Check that PARAM_BASE_DIR is correct and that the folder {date_tag} exists."
+        )
+
+    os.makedirs(data_recv, exist_ok=True)
+
+    return {
+        "date_tag":      date_tag,
+        "base":          base,
+        "date_dir":      date_dir,
+        "data_dir":      data_dir,
+        "data_received": data_recv,
+    }
+
+
+def find_observer_files(data_dir: str) -> list:
+    """
+    Return a sorted list of all .dat observer files found in *data_dir*
+    (i.e. inside the MMM_YY/Data/ folder).
+    Raises FileNotFoundError with a clear message if none are found.
+    """
+    pattern = os.path.join(data_dir, "*.dat")
+    files   = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(
+            f"No .dat observer files found in:\n  {data_dir}\n"
+            "Place observer .dat files in the 'Data' folder."
+        )
+    return files
+```
+
+---
+
+## The `Observer` Class
+
+Each participating observer is represented by a single `Observer` instance.
+That instance aggregates:
+
+- **Identity** — numeric ID, string ID, and name fields loaded from
+  `SIDAnalObservers.ini`.
+- **Reports** — one dictionary per submitted data file, each containing the
+  list of parsed `event` dictionaries.
+- **Quality** — a running quality rating (0–10) updated after each analysis
+  run if `PARAM_UPDATE_INI` is `True`.
+
+### Data structure
+
+```
+Observer
+├── ID          int   numeric observer id
+├── id          str   string id, e.g. 'A050'
+├── strSTA      str   default station code from filename
+├── name        str
+├── ngdcName    str   'F Lastname' format for NGDC files
+├── location    str   'City, State'
+├── quality     int   running quality rating (0-10)
+├── qualCount   int   number of reports used in rating
+├── nReports    int
+└── reports     list of report dicts
+    ├── path          str
+    ├── filen         str
+    ├── station       str   e.g. '24.0kHz (NAA)'
+    ├── nEvents       int
+    ├── unusedEvents  int
+    ├── qualRatio     int   (correlated/total)*10
+    └── Events        list of event dicts
+        ├── strEvent    str   raw line from file
+        ├── importance  int   0-6
+        ├── day         int
+        ├── peakTime    int   minutes since midnight
+        ├── duration    int   minutes
+        └── crFlag      int   0 = uncorrelated
+```
+
+The entire class is defined in one cell so Python sees all methods as part of
+the same class body.  The subsection descriptions are preserved as comments.
+
+```{python}
+#| eval: true
+
+class Observer:
+    """Holds observer metadata and the reports (with events) submitted for analysis."""
+
+    # ------------------------------------------------------------------
+    # Constructor
+    # ------------------------------------------------------------------
+
+    def __init__(self, numeric_id: int, str_id: str, station_code: str):
+        self.ID        = numeric_id
+        self.id        = str_id
+        self.strSTA    = station_code
+        self.nReports  = 0
+        self.reports: list = []
+        self.name      = ""
+        self.ngdcName  = ""
+        self.location  = ""
+        self.quality   = 0
+        self.qualCount = 0
+
+    # ------------------------------------------------------------------
+    # get_observer_info — load metadata from SIDAnalObservers.ini
+    # ------------------------------------------------------------------
+
+    def get_observer_info(
+        self,
+        observers_ini: str,
+        get_name=None,
+        get_location=None,
+    ) -> None:
+        """
+        Load (or create) observer metadata from *observers_ini*.
+
+        If no entry exists for this observer, *get_name* and *get_location*
+        callables are invoked to obtain the missing data.  Both default to
+        interactive input() prompts; pass custom callables for testing.
+        """
+        if get_name is None:
+            get_name = lambda: input(f"Enter full name for observer {self.id}: ")
+        if get_location is None:
+            get_location = lambda: input(
+                f"Enter location for {self.id} (format: City, State): "
+            )
+
+        config = configparser.RawConfigParser()
+        config.optionxform = str
+        config.read(observers_ini)
+
+        if not config.has_option("NGDC NAME", self.id):
+            print(f"No entry in {observers_ini} for {self.id} — adding now.")
+            name     = get_name()
+            parts    = name.split()
+            ngdc     = f"{parts[0][0]} {parts[-1]}" if len(parts) >= 2 else name
+            location = get_location()
+
+            for section, key, value in [
+                ("NAME",           self.id, name),
+                ("NGDC NAME",      self.id, ngdc),
+                ("LOCATION",       self.id, location),
+                ("QUALITY RATING", self.id, "0"),
+                ("QUALITY COUNT",  self.id, "0"),
+            ]:
+                if not config.has_section(section):
+                    config.add_section(section)
+                config.set(section, key, value)
+
+            with open(observers_ini, "w") as fh:
+                config.write(fh)
+
+        self.name      = config.get("NAME",           self.id)
+        self.ngdcName  = config.get("NGDC NAME",      self.id)
+        self.location  = config.get("LOCATION",       self.id)
+        self.quality   = int(config.get("QUALITY RATING", self.id))
+        self.qualCount = int(config.get("QUALITY COUNT",  self.id))
+
+    # ------------------------------------------------------------------
+    # init_report / _get_station_info — set up a report dict
+    # Creates the report dictionary and resolves the VLF station frequency
+    # string from SIDAnalStations.ini, prompting if the station is unknown.
+    # ------------------------------------------------------------------
+
+    def init_report(
+        self,
+        station_code: str,
+        filepath: str,
+        stations_ini: str = DEFAULT_STATION_INI,
+    ) -> None:
+        """Append a new report dict for *filepath* and resolve station info."""
+        report = {
+            "path":         filepath,
+            "filen":        os.path.basename(filepath),
+            "station":      self._get_station_info(station_code, stations_ini),
+            "nEvents":      0,
+            "unusedEvents": 0,
+            "qualRatio":    0,
+            "Events":       [],
+        }
+        self.reports.append(report)
+
+    def _get_station_info(self, station_code: str, stations_ini: str) -> str:
+        """Return the frequency string for *station_code*, prompting if unknown."""
+        config = configparser.RawConfigParser()
+        config.optionxform = str
+        config.read(stations_ini)
+
+        if not config.has_option("FREQUENCY", station_code):
+            while True:
+                freq = input(
+                    f"No frequency for {station_code} in {stations_ini}. "
+                    "Enter VLF frequency (kHz, digits only): "
+                )
+                if not freq.isalpha():
+                    break
+                print("Numeric input required — no letters. Try again.")
+
+            if not config.has_section("FREQUENCY"):
+                config.add_section("FREQUENCY")
+            config.set("FREQUENCY", station_code, f"{freq}kHz ({station_code})")
+            with open(stations_ini, "w") as fh:
+                config.write(fh)
+
+        return config.get("FREQUENCY", station_code)
+
+    # ------------------------------------------------------------------
+    # get_events — parse the .dat file
+    # Lines beginning with "40" are SID events.  Some timestamps carry a
+    # trailing D, E, or U character which is stripped before parsing.
+    # ------------------------------------------------------------------
+
+    def get_events(self, report_index: int) -> None:
+        """Parse SID event lines from the report file and populate report['Events']."""
+        report = self.reports[report_index]
+        events = []
+        problem_entry = 0
+
+        with open(report["path"], "r") as fh:
+            for line in fh:
+                fields = line.split()
+                if not fields or fields[0] != "40":
+                    continue
+
+                problem_entry += 1
+
+                # Strip trailing D/E/U characters appended to timestamp fields
+                if len(fields) != 8:
+                    for ch in ("D", "E", "U"):
+                        line = line.replace(ch, " ")
+                    fields = line.split()
+
+                try:
+                    event = {
+                        "day":        int(fields[1][-2:]),
+                        "peakTime":   time_ascii_to_int(fields[4][:4]),
+                        "importance": IMPORTANCE_MAP[fields[5][:2]],
+                        "duration":   (
+                            time_ascii_to_int(fields[3][:4])
+                            - time_ascii_to_int(fields[2][:4])
+                        ),
+                        "crFlag":     FALSE,
+                        "strEvent":   line.rstrip(),
+                    }
+                    events.append(event)
+                except (KeyError, ValueError, IndexError):
+                    print(
+                        f"  Warning: {os.path.basename(report['path'])} — "
+                        f"unexpected event string at entry {problem_entry}, skipped."
+                    )
+
+        report["nEvents"] += len(events)
+        report["Events"]   = events
+        self.nReports     += 1
+
+    # ------------------------------------------------------------------
+    # Dunder methods
+    # ------------------------------------------------------------------
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Observer):
+            return False
+        return self.__dict__ == other.__dict__
+
+    def __str__(self) -> str:
+        return ", ".join(f"{k}:{v}" for k, v in sorted(self.__dict__.items()))
+```
+
+---
+
+## Reading Observer Reports
+
+`read_reports` iterates over the selected `.dat` files, parses the filename
+into observer ID and station code, creates or locates the matching `Observer`,
+and calls `init_report` / `get_events` for each file.
+
+Observer file names follow the convention `A<NNN><STA>.dat` where `<NNN>` is a
+zero-padded integer and `<STA>` is a three-letter VLF station code.
+
+```{python}
+#| eval: true
+
+def read_reports(files: list, control: dict, observers_ini: str) -> list:
+    """
+    For each file, create or locate the matching Observer, initialise a report,
+    and parse its events.  Returns a list of Observer objects sorted by string ID.
+    """
+    observers:   list = []
+    obs_id_list: list = []
+
+    for filepath in files:
+        basename = os.path.splitext(os.path.basename(filepath))[0]
+        int_id   = basename[1:-3]   # numeric portion, e.g. '050'
+        str_id   = basename[:-3]    # full string id,   e.g. 'A050'
+        sta_code = basename[-3:]    # station code,      e.g. 'NAA'
+
+        if not int_id.isdigit():
+            print(f"  Warning: unexpected observer ID {int_id!r} in {basename} — skipping.")
+            continue
+        if not sta_code.isalpha():
+            print(f"  Warning: unexpected station code {sta_code!r} in {basename} — skipping.")
+            continue
+
+        int_id = int(int_id)
+
+        if int_id not in obs_id_list:
+            obs = Observer(int_id, str_id, sta_code)
+            obs.get_observer_info(observers_ini)
+            observers.append(obs)
+            obs_id_list.append(int_id)
+            control["nObservers"] += 1
+
+        idx          = obs_id_list.index(int_id)
+        report_index = observers[idx].nReports
+        observers[idx].init_report(sta_code, filepath)
+        observers[idx].get_events(report_index)
+
+    observers.sort(key=lambda o: o.id)
+    return observers
+```
+
+---
+
+## Correlation
+
+### Overview
+
+The correlation pipeline runs in four stages:
+
+1. **Observer–observer** (`correlate_observers`) — events from different
+   observers within ±5 minutes of each other are grouped into a correlated
+   event.  A two-pass algorithm first gathers candidates and computes an
+   average peak time, then re-scans all observers against that average to
+   capture events slightly outside the initial window.
+
+2. **Stragglers** (`compare_observers_to_corr_list`) — any still-uncorrelated
+   event within ±15 minutes of an existing correlated group is absorbed into
+   that group and the running average updated.
+
+3. **GOES XRA** (`compare_to_xra_fla` with `XRA_CORRELATED`) — remaining
+   uncorrelated events matched against the X-ray catalogue within ±15 minutes.
+
+4. **GOES FLA** (`compare_to_xra_fla` with `FLA_CORRELATED`) — same process
+   for the optical flare catalogue.
+
+An optional fifth stage (`detect_hi_qual_non_correlated`) promotes isolated
+events from high-quality observers regardless of cross-matches.
+
+### Low-level event matcher
+
+```{python}
+#| eval: true
+
+def match_event(timerange: int, day: int, pk_time: float, event_list: list) -> int:
+    """
+    Return the index of the first uncorrelated event in *event_list* that falls
+    within *timerange* minutes of *pk_time* on *day*, or -1 if none found.
+    """
+    for i, event in enumerate(event_list):
+        if not event["crFlag"] and event["day"] == day:
+            if abs(event["peakTime"] - pk_time) <= timerange:
+                return i
+    return -1
+```
+
+### Stage 1 — observer–observer correlation
+
+```{python}
+#| eval: true
+
+def correlate_observers(timerange: int, control: dict, observers: list) -> list:
+    """
+    Correlate events across observers within *timerange* minutes of each other.
+    Updates event crFlag values in-place.  Returns the list of correlated events.
+    """
+    corr_events: list = []
+    c_idx = control["nCorr"]
+
+    for o_idx, obs in enumerate(observers):
+        for report in obs.reports:
+            for event in report["Events"]:
+                if event["crFlag"] != FALSE:
+                    continue
+
+                corr_found = False
+                ave_peak   = event["peakTime"]
+                ave_count  = 1
+
+                # First pass: collect candidates and build an average peak time.
+                s_ind = 1 + obs.reports.index(report)
+                for obs2 in observers[o_idx:]:
+                    for report2 in obs2.reports[s_ind:]:
+                        m = match_event(
+                            timerange, event["day"], event["peakTime"],
+                            report2["Events"],
+                        )
+                        if m != -1:
+                            corr_found  = True
+                            ave_peak   += report2["Events"][m]["peakTime"]
+                            ave_count  += 1
+                            break
+                    s_ind = 0
+
+                if not corr_found:
+                    continue
+
+                ave_peak /= ave_count
+
+                # Second pass: correlate against the averaged peak time.
+                for obs2 in observers:
+                    for report2 in obs2.reports:
+                        m = match_event(
+                            timerange, event["day"], ave_peak, report2["Events"]
+                        )
+                        if m == -1:
+                            continue
+
+                        if not event["crFlag"]:
+                            corr_events.append({
+                                "importance": event["importance"],
+                                "day":        event["day"],
+                                "peak":       event["peakTime"],
+                                "crFlag":     USER_CORRELATED,
+                                "count":      1,
+                            })
+                            event["crFlag"] += 1
+
+                        corr_events[c_idx]["importance"] += report2["Events"][m]["importance"]
+                        corr_events[c_idx]["peak"]       += report2["Events"][m]["peakTime"]
+                        corr_events[c_idx]["count"]      += 1
+                        report2["Events"][m]["crFlag"]   += 1
+
+                corr_events[c_idx]["importance"] /= corr_events[c_idx]["count"]
+                corr_events[c_idx]["peak"]       /= corr_events[c_idx]["count"]
+                c_idx += 1
+
+    control["nCorr"] = c_idx
+    return corr_events
+```
+
+### Stage 2 — stragglers against the correlated list
+
+```{python}
+#| eval: true
+
+def compare_observers_to_corr_list(
+    timerange: int, control: dict, observers: list, corr_events: list
+) -> list:
+    """Absorb still-uncorrelated events into existing groups if within *timerange*."""
+    for o_idx, obs in enumerate(observers):
+        for report in obs.reports:
+            for event in report["Events"]:
+                if event["crFlag"]:
+                    continue
+                for corr in corr_events[o_idx + 1:]:
+                    if (corr["day"] == event["day"]
+                            and abs(corr["peak"] - event["peakTime"]) <= timerange):
+                        n = corr["count"]
+                        corr["peak"]       = (corr["peak"] * n + event["peakTime"]) / (n + 1)
+                        corr["importance"] = (corr["importance"] * n + event["importance"]) / (n + 1)
+                        corr["count"]     += 1
+                        event["crFlag"]   += 1
+                        break
+    return corr_events
+```
+
+### GOES XRA / FLA helpers
+
+```{python}
+#| eval: true
+
+def match_xra_fla_event(
+    timerange: int, day: int, pk_time: int, xrafla_data: list
+) -> bool:
+    """Return True if any entry in *xrafla_data* matches *day* within *timerange*."""
+    for entry in xrafla_data:
+        if entry["day"] == -1 or entry["day"] > day:
+            break
+        if entry["day"] == day and abs(entry["peak"] - pk_time) <= timerange:
+            return True
+    return False
+
+
+def compare_to_xra_fla(
+    timerange: int,
+    control: dict,
+    observers: list,
+    corr: list,
+    xrafla_data: list,
+    status: int,
+) -> int:
+    """
+    Correlate uncorrelated observer events against XRA or FLA satellite data.
+    Returns the number of new correlations added.
+    """
+    c_idx = control["nCorr"]
+    for obs in observers:
+        for report in obs.reports:
+            for event in report["Events"]:
+                if not event["crFlag"]:
+                    if match_xra_fla_event(
+                        timerange, event["day"], event["peakTime"], xrafla_data
+                    ):
+                        corr.append({
+                            "importance": event["importance"],
+                            "day":        event["day"],
+                            "peak":       event["peakTime"],
+                            "count":      1,
+                            "userID":     obs.ID,
+                            "crFlag":     status,
+                        })
+                        event["crFlag"] = status
+                        c_idx += 1
+    return c_idx - control["nCorr"]
+```
+
+### High-quality observer promotion
+
+```{python}
+#| eval: true
+
+def detect_hi_qual_non_correlated(
+    control: dict, observers: list, corr: list
+) -> int:
+    """
+    Include uncorrelated events from observers whose quality rating meets or
+    exceeds *HiQualLimit*.  Returns the number of new entries added to *corr*.
+    """
+    c_idx = control["nCorr"]
+    for obs in observers:
+        if obs.quality < control["HiQualLimit"] and control["HiQualLimit"] != 0:
+            continue
+        for report in obs.reports:
+            if report["qualRatio"] < 5 and control["HiQualLimit"] != 0:
+                continue
+            for event in report["Events"]:
+                if not event["crFlag"]:
+                    corr.append({
+                        "importance": event["importance"],
+                        "day":        event["day"],
+                        "peak":       event["peakTime"],
+                        "count":      1,
+                        "userID":     obs.ID,
+                        "crFlag":     HIQUAL_CORRELATED,
+                    })
+                    event["crFlag"] = HIQUAL_CORRELATED
+                    c_idx += 1
+    return c_idx - control["nCorr"]
+```
+
+### Quality ratio computation
+
+```{python}
+#| eval: true
+
+def compute_unused_observer_events(
+    control: dict,
+    observers: list,
+    update_quality: bool,
+    observers_ini: str = DEFAULT_OBSERVERS_INI,
+) -> None:
+    """
+    Compute qualRatio for every report.  If *update_quality* is True and the
+    report's ratio exceeds 2, the observer's running quality rating is updated
+    and written back to *observers_ini*.
+    """
+    for obs in observers:
+        for report in obs.reports:
+            unused = sum(1 for e in report["Events"] if not e["crFlag"])
+            report["unusedEvents"] = unused
+            n = report["nEvents"]
+            report["qualRatio"] = int((n - unused) / float(n) * 10) if n else 0
+
+            if update_quality and report["qualRatio"] > 2:
+                obs.quality = (
+                    (obs.quality * obs.qualCount + report["qualRatio"])
+                    / (obs.qualCount + 1)
+                )
+                obs.qualCount += 1
+                config = configparser.RawConfigParser()
+                config.optionxform = str
+                config.read(observers_ini)
+                config.set("QUALITY RATING", obs.id, str(obs.quality))
+                config.set("QUALITY COUNT",  obs.id, str(obs.qualCount))
+                with open(observers_ini, "w") as fh:
+                    config.write(fh)
+```
+
+### Sorting
+
+```{python}
+#| eval: true
+
+def sort_correlation_list(item1: dict, item2: dict) -> int:
+    """Comparator for sorting correlated events by day then peak time."""
+    if item1["day"] != item2["day"]:
+        return -1 if item1["day"] < item2["day"] else 1
+    if item1["peak"] != item2["peak"]:
+        return -1 if item1["peak"] < item2["peak"] else 1
+    return 0
+```
+
+---
+
+## Reading GOES Data
+
+The GOES XRA and FLA pre-processed files are produced upstream by
+`1goesevents.py`.  Both loaders append a sentinel entry with `day = -1` so
+that `match_xra_fla_event` can break its loop cleanly.
+
+XRA and FLA files are read from `control["date_dir"]` (the `MMM_YY/` folder),
+keeping them separate from the output written to `MMM_YY/Reports/`.
+
+### XRA (X-ray)
+
+```{python}
+#| eval: true
+
+def read_xra(control: dict) -> list:
+    """Load XRA (X-ray) event data from the month's pre-processed file."""
+    class_strength = {"A": 1, "B": 10, "C": 100, "M": 1000, "X": 10000}
+    filename = os.path.join(
+        control["date_dir"],
+        f"{control['month']}_{control['year']}XRA.txt",
+    )
+    xra = []
+    with open(filename, "r") as fh:
+        for line in fh:
+            if line[0].isdigit():
+                xra.append({
+                    "day":       int(line[3:5]),
+                    "peak":      time_ascii_to_int(line[17:21]),
+                    "duration":  (
+                        time_ascii_to_int(line[24:28])
+                        - time_ascii_to_int(line[10:14])
+                    ),
+                    "strength":  line[35:40],
+                    "strengthN": class_strength[line[35]] * float(line[36:39]),
+                })
+    xra.append({"day": -1})
+    return xra
+
+
+def read_fla(control: dict) -> list:
+    """Load FLA (optical flare) event data from the month's pre-processed file."""
+    filename = os.path.join(
+        control["date_dir"],
+        f"{control['month']}_{control['year']}FLA.txt",
+    )
+    fla = []
+    with open(filename, "r") as fh:
+        for line in fh:
+            if line[0].isdigit():
+                fla.append({
+                    "day":      int(line[3:5]),
+                    "peak":     time_ascii_to_int(line[17:21]),
+                    "duration": (
+                        time_ascii_to_int(line[24:28])
+                        - time_ascii_to_int(line[10:14])
+                    ),
+                })
+    fla.append({"day": -1})
+    return fla
+```
+
+---
+
+## Importance Summary
+
+```{python}
+#| eval: true
+
+def sum_importance_levels(control: dict, corr_events: list, mode: int) -> int:
+    """
+    Tally events per importance level (0–6), store in control['nImp'],
+    and return the grand total.
+    """
+    control["nImp"] = []
+    total = 0
+    for i in range(7):
+        count = 0
+        for corr in corr_events:
+            if corr["importance"] != i:
+                continue
+            if mode == DB_FULL:
+                count += 1
+            elif mode == DB_PARTIAL:
+                flag = corr["crFlag"]
+                if flag in (USER_CORRELATED, HIQUAL_CORRELATED):
+                    count += 1
+                elif flag in (XRA_CORRELATED, FLA_CORRELATED) and corr["peak"] <= 600:
+                    count += 1
+        control["nImp"].append(count)
+        total += count
+    return total
+```
+
+---
+
+## Output Generators
+
+### NGDC text report
+
+```{python}
+#| eval: true
+
+def generate_ngdc_file(control: dict, observers: list) -> None:
+    """Write the NGDC-format SID report text file."""
+    mo_year  = f"{month_str(control['month'])}, 20{control['year']}"
+    filename = os.path.join(
+        control["path"],
+        f"SIDngdc_{control['month']}{control['year']}.txt",
+    )
+    with open(filename, "w") as fh:
+        fh.write("                         Sudden Ionospheric Disturbance Report\n")
+        fh.write(f"                                    -- {mo_year} --\n\n")
+
+        for obs in observers:
+            obs_line = f"{obs.id} {obs.ngdcName}, {obs.location} -"
+            for report in obs.reports:
+                obs_line += f" {report['station']}"
+            fh.write(obs_line.rstrip() + "\n\n")
+
+        event_lines = [
+            e["strEvent"]
+            for obs in observers
+            for report in obs.reports
+            for e in report["Events"]
+            if e["crFlag"]
+        ]
+        event_lines.sort(key=lambda s: s[5:18] + s[69:74])
+
+        for line in event_lines:
+            fh.write("\n" + line)
+
+        fh.write("\n\n-- End Report --")
+
+    print(f"  Written: {filename}")
+```
+
+### Database file (partial and full)
+
+```{python}
+#| eval: true
+
+def generate_database_file(
+    control: dict, observers: list, corr_events: list, mode: int
+) -> None:
+    """Write the SID database text file (partial or full) and CSV importance summary."""
+    cr_type = {0: "", 1: "XRA", 2: "FLA", 3: "QUAL"}
+    month   = control["month"].capitalize()
+    mm      = f"{MONTH_NUMS.index(control['month'].lower()) + 1:02d}"
+    year    = f"20{control['year']}"
+    mo_year = f"{month} {year}"
+
+    db_filename = os.path.join(
+        control["path"],
+        f"SIDDatabase_{month}{control['year']}.txt"
+        if mode == DB_PARTIAL
+        else f"SIDDatabaseFull_{month}{control['year']}.txt",
+    )
+    csv_filename = os.path.join(control["path"], f"{year}{mm}DatabaseFullSumm.csv")
+
+    with open(db_filename, "w") as fh:
+        fh.write("AAVSO Sudden Ionospheric Disturbance Report")
+        fh.write(f"\n{month} {year}\n\nObservers:\n")
+
+        ids   = [o.id for o in observers]
+        k     = control["nObservers"] // 2
+        line1 = 1 if k == 0 else k + control["nObservers"] % k
+        line2 = 0 if k == 0 else k
+        fh.write("\t".join(ids[:line1]) + "\n")
+        if line2:
+            fh.write("\t".join(ids[line1: line1 + line2]) + "\n")
+
+        fh.write("\n\nYYMMDD          Event Peak              Importance")
+
+        for corr in corr_events:
+            flag  = corr["crFlag"]
+            early = corr["peak"] <= 600
+            if not (
+                mode == DB_FULL
+                or flag in (USER_CORRELATED, HIQUAL_CORRELATED)
+                or (flag in (XRA_CORRELATED, FLA_CORRELATED) and early)
+            ):
+                continue
+
+            date_str = set_date_for_db_file(
+                control["year"], control["month"], corr["day"]
+            )
+            fh.write(
+                f"\n{date_str}\t\t{time_int_to_ascii(int(corr['peak']))}"
+                f"\t\t\t{importance_to_str(int(corr['importance']))}"
+            )
+            if mode == DB_FULL and corr["count"] == 1:
+                fh.write(
+                    f"\t{corr.get('userID', '')} - {cr_type.get(flag - 1, '')}"
+                )
+
+        total = sum_importance_levels(control, corr_events, mode)
+
+        fh.write("\n\n\n\n" + "*" * 50)
+        fh.write(f"\nImportance Summary - {mo_year}")
+        for i in range(7):
+            fh.write(f"\n\t{importance_to_str(i):2s} events: {control['nImp'][i]:2d}")
+        fh.write(f"\n ------------------\n   Total events: {total:02d}")
+
+    print(f"  Written: {db_filename}")
+
+    with open(csv_filename, "w") as fh:
+        for i in range(7):
+            fh.write(f"\n\t{importance_to_str(i)},{control['nImp'][i]:2d}")
+    print(f"  Written: {csv_filename}")
+
+    response = control.get("response", [])
+    if (
+        ("3" in response and mode == DB_FULL)
+        or ("4" in response and mode == DB_PARTIAL)
+        or "*" in response
+    ):
+        generate_analysis_summary_file(control, observers, corr_events, mode, mo_year)
+```
+
+### Analysis summary file
+
+```{python}
+#| eval: true
+
+def generate_analysis_summary_file(
+    control: dict,
+    observers: list,
+    corr_events: list,
+    mode: int,
+    mo_year: str,
+) -> None:
+    """Write a human-readable analysis summary file."""
+    mode_str = "FULL" if mode == DB_FULL else "PARTIAL"
+    filename = os.path.join(
+        control["path"],
+        "SID_DatabaseFull_Sum.txt" if mode == DB_FULL else "SID_Database_Sum.txt",
+    )
+    with open(filename, "w") as fh:
+        fh.write(
+            f"Data Analysis Summary file   -  "
+            f"{month_str(control['month'])}, 20{control['year']}\n"
+        )
+        if control["enableXRA"] or control["enableFLA"]:
+            fh.write("\n\nSecondary correlation with GOES XRA, FLA Data was performed")
+            if mode == DB_PARTIAL:
+                fh.write(
+                    "\n  XRA, FLA correlated events included only if event time < 1000 UT"
+                )
+            else:
+                fh.write("\n  All XRA, FLA correlated events included in this listing")
+        fh.write(
+            f"\n\nUncorrelated events included for observers with "
+            f"quality rating >= {control['HiQualLimit']:d}"
+        )
+        fh.write(f"\n\nImportance Summary - {mo_year}  {mode_str}")
+        fh.write("\n\nImportance\tCount")
+        for i in range(7):
+            fh.write(f"\n{importance_to_str(i):2s} \t\t{control['nImp'][i]:2d}")
+        fh.write("\n\n\n\nContributing Observers\n")
+        for obs in observers:
+            stations = " ".join(r["station"].split()[1][1:-1] for r in obs.reports)
+            fh.write(f"\n{obs.ngdcName}{10 * ' '}\t{obs.id}\t{stations}")
+
+    print(f"  Written: {filename}")
+```
+
+### Observer unused-event summary
+
+```{python}
+#| eval: true
+
+def generate_file_of_unused_observer_events(control: dict, observers: list) -> None:
+    """Write a per-observer listing of all uncorrelated events."""
+    compute_unused_observer_events(control, observers, False)
+
+    filename = os.path.join(control["path"], "Observers Summary.txt")
+    with open(filename, "w") as fh:
+        fh.write(
+            f"SID OBSERVER Unused Event Summary  -  "
+            f"{month_str(control['month'])}, 20{control['year']}\n"
+        )
+        fh.write(
+            f"\n\nMinimum observer quality rating used in analysis "
+            f"- [{control['HiQualLimit']}]"
+        )
+        fh.write(
+            "\n\nObserver quality rating based on correlated events only,\n"
+            "not events included due to previous high quality rating."
+        )
+        for obs in observers:
+            fh.write(
+                f"\n\nObserver: {obs.id:4}   -   {obs.name}"
+                f"\t\t\tQuality Rating: {obs.quality} for {obs.qualCount} reports"
+            )
+            for report in obs.reports:
+                fh.write(f"\n    Station: {report['station']}")
+                fh.write(f"\n      Quality Rating:  [{report['qualRatio']:2d}]")
+                fh.write(f"\n        Total events:  {report['nEvents']:2d}")
+                fh.write(f"\n       Unused events:  {report['unusedEvents']:2d}")
+                for event in report["Events"]:
+                    if not event["crFlag"]:
+                        fh.write(f"\n        {event['strEvent']}")
+
+    print(f"  Written: {filename}")
+```
+
+---
+
+## Run Analysis {#run-analysis}
+
+This cell uses the parameters defined at the top of the document to execute
+the full pipeline.  It is the **only** cell that performs I/O or writes files.
+
+### Pipeline
+
+```
+resolve_run_paths()  →  find_observer_files()  →  read_reports()
+  ↓
+correlate_observers(±5 min)
+  ↓
+compare_observers_to_corr_list(±15 min)
+  ↓
+compare_to_xra_fla(±15 min, XRA)   [if PARAM_ENABLE_XRA]
+  ↓
+compare_to_xra_fla(±15 min, FLA)   [if PARAM_ENABLE_FLA]
+  ↓
+compute_unused_observer_events()   [updates obs_ini if PARAM_UPDATE_INI]
+  ↓
+detect_hi_qual_non_correlated()    [if PARAM_HI_QUAL_LIMIT < 10]
+  ↓
+sorted(corr)
+  ↓
+generate_database_file(DB_PARTIAL)          ← always
+generate_ngdc_file()                        ← if "1" or "*" in PARAM_REPORTS
+generate_database_file(DB_FULL)             ← if "2" or "*" in PARAM_REPORTS
+generate_file_of_unused_observer_events()   ← if "5" or "*" in PARAM_REPORTS
+```
+
+```{python}
+#| eval: true
+#| code-fold: false
+
+# ── Resolve paths from parameters ────────────────────────────────────────────
+paths = resolve_run_paths(PARAM_MONTH, PARAM_YEAR, PARAM_BASE_DIR)
+
+# INI files: use explicit path if given, otherwise look in base_dir
+obs_ini = (
+    os.path.expanduser(PARAM_OBSERVERS_INI)
+    if PARAM_OBSERVERS_INI.strip()
+    else os.path.join(paths["base"], DEFAULT_OBSERVERS_INI)
+)
+sta_ini = (
+    os.path.expanduser(PARAM_STATIONS_INI)
+    if PARAM_STATIONS_INI.strip()
+    else os.path.join(paths["base"], DEFAULT_STATION_INI)
+)
+
+# ── Diagnostic: print every resolved path before doing any work ──────────────
+print("=" * 60)
+print("SID Reporter — path resolution")
+print("=" * 60)
+print(f"  Period         : {paths['date_tag']}")
+print(f"  Base dir       : {paths['base']}")
+print(f"  Date folder    : {paths['date_dir']}")
+print(f"  Data folder    : {paths['data_dir']}")
+print(f"  Output folder  : {paths['data_received']}")
+print(f"  Observers INI  : {obs_ini}  {'[found]' if os.path.isfile(obs_ini) else '[NOT FOUND]'}")
+print(f"  Stations INI   : {sta_ini}  {'[found]' if os.path.isfile(sta_ini) else '[NOT FOUND]'}")
+print(f"  Enable XRA     : {PARAM_ENABLE_XRA}")
+print(f"  Enable FLA     : {PARAM_ENABLE_FLA}")
+print(f"  HiQualLimit    : {PARAM_HI_QUAL_LIMIT}")
+print(f"  Reports        : {PARAM_REPORTS}")
+print()
+
+# ── Build control dictionary ──────────────────────────────────────────────────
+control = {
+    "month":           PARAM_MONTH.upper(),
+    "year":            PARAM_YEAR.strip(),
+    "path":            paths["data_received"],
+    "date_dir":        paths["date_dir"],
+    "enableXRA":       PARAM_ENABLE_XRA,
+    "enableFLA":       PARAM_ENABLE_FLA,
+    "HiQualLimit":     PARAM_HI_QUAL_LIMIT,
+    "enableINIUpdate": PARAM_UPDATE_INI,
+    "response":        PARAM_REPORTS,
+    "nObservers":      0,
+    "nEvents":         0,
+    "nCorr":           0,
+    "nImp":            [],
+}
+
+# ── Locate observer files (in MMM_YY/Data/) ──────────────────────────────────
+files = find_observer_files(paths["data_dir"])
+print(f"Found {len(files)} observer file(s):")
+for f in files:
+    print(f"  {os.path.basename(f)}")
+
+# ── Read reports ──────────────────────────────────────────────────────────────
+print("\nReading reports...")
+observers = read_reports(files, control, obs_ini)
+print(f"  {control['nObservers']} observer(s) loaded.")
+
+# ── Load GOES data ────────────────────────────────────────────────────────────
+xra = read_xra(control) if control["enableXRA"] else []
+fla = read_fla(control) if control["enableFLA"] else []
+if xra:
+    print(f"  XRA events loaded: {len(xra) - 1}")
+if fla:
+    print(f"  FLA events loaded: {len(fla) - 1}")
+
+# ── Correlation pipeline ──────────────────────────────────────────────────────
+print("\nCorrelating...")
+corr = correlate_observers(5, control, observers)
+print(f"  Observer–observer correlations : {control['nCorr']}")
+
+corr = compare_observers_to_corr_list(15, control, observers, corr)
+
+if control["enableXRA"]:
+    n = compare_to_xra_fla(15, control, observers, corr, xra, XRA_CORRELATED)
+    control["nCorr"] += n
+    print(f"  XRA correlations added         : {n}")
+
+if control["enableFLA"]:
+    n = compare_to_xra_fla(15, control, observers, corr, fla, FLA_CORRELATED)
+    control["nCorr"] += n
+    print(f"  FLA correlations added         : {n}")
+
+compute_unused_observer_events(control, observers, control["enableINIUpdate"], obs_ini)
+
+if control["HiQualLimit"] < 10:
+    n = detect_hi_qual_non_correlated(control, observers, corr)
+    control["nCorr"] += n
+    print(f"  High-quality promotions        : {n}")
+
+print(f"  Total correlated events        : {control['nCorr']}")
+
+corr = sorted(corr, key=cmp_to_key(sort_correlation_list))
+
+# ── Write output files ────────────────────────────────────────────────────────
+print("\nWriting output files...")
+generate_database_file(control, observers, corr, DB_PARTIAL)
+
+if "1" in PARAM_REPORTS or "*" in PARAM_REPORTS:
+    generate_ngdc_file(control, observers)
+
+if "2" in PARAM_REPORTS or "*" in PARAM_REPORTS:
+    generate_database_file(control, observers, corr, DB_FULL)
+
+if "5" in PARAM_REPORTS or "*" in PARAM_REPORTS:
+    generate_file_of_unused_observer_events(control, observers)
+
+print("\nDone.")
+```
+
+---
+
+## Rendering Instructions
+
+### Required directory layout
+
+Before rendering, your data directory must look like this:
+
+```
+C:\Users\Owner\Documents\SSN3_SIDROOT\     ← PARAM_BASE_DIR
+├── SIDAnalObservers.ini
+├── SIDAnalStations.ini
+└── JUN_11\                                ← created from PARAM_MONTH + PARAM_YEAR
+    ├── JUN_11XRA.txt                      ← GOES XRA file (from 1goesevents.py)
+    ├── JUN_11FLA.txt                      ← GOES FLA file (from 1goesevents.py)
+    ├── Data\                              ← observer .dat files go here
+    │   ├── A050NAA.dat
+    │   └── A063NAA.dat
+    └── Reports\                           ← created automatically; output written here
+```
+
+### Steps
+
+1. Edit the **Analysis Parameters** cell at the top of this document —
+   at minimum set `PARAM_MONTH`, `PARAM_YEAR`, and `PARAM_BASE_DIR`.
+2. Place observer `.dat` files in the `MMM_YY/Data/` folder.
+3. If using GOES correlation, place the `XRA.txt` and `FLA.txt` files
+   (produced by `1goesevents.py`) in the `MMM_YY/` folder, or
+   set `PARAM_ENABLE_XRA = False` and `PARAM_ENABLE_FLA = False`.
+4. Run one of the commands below.
+
+```bash
+# HTML output — runs the analysis during render
+quarto render 3reporter_main_v1_4.qmd
+
+# PDF output (requires TinyTeX)
+quarto render 3reporter_main_v1_4.qmd --to pdf
+
+# Install TinyTeX for PDF support if needed
+quarto install tinytex
+```
+
+Output files are written to `<PARAM_BASE_DIR>\<MMM_YY>\Reports\`.
+The rendered HTML or PDF itself serves as the run log, showing every resolved
+path and a count of events found, correlated, and written.

@@ -1,13 +1,13 @@
 ---
-title: "GOES Solar Event Extractor"
-subtitle: "Extract and format FLA / XRA events from GOES daily event listing files"
-author: "SID Analysis Pipeline"
+title: GOES Solar Event Extractor
+subtitle: Extract and format FLA / XRA events from GOES daily event listing files
+author: SID Analysis Pipeline
 date: today
 format:
   html:
     toc: true
     toc-depth: 3
-    toc-title: "Contents"
+    toc-title: Contents
     code-fold: show
     code-tools: true
     code-overflow: scroll
@@ -22,59 +22,9 @@ format:
 execute:
   echo: true
   warning: true
-  error: false
+  error: true
 jupyter: python3
 ---
-
-## Overview
-
-This notebook extracts **solar flare (FLA)** and/or **X-ray (XRA)** events
-from GOES satellite daily event listing files and writes sorted, formatted
-output files for downstream analysis (e.g. `goes_summ.py` or import into R).
-
-It is a direct port of `1goesevents.py` to a literate, reproducible Quarto
-document. Each section below corresponds to a logical stage of the pipeline.
-
----
-
-## Directory Layout
-
-The pipeline expects the following structure on disk. The `Data Received/`
-directory is created automatically if it does not already exist.
-
-```
-<base_dir>/
-└── <MMM_YY>/                       e.g.  JUN_11/
-    ├── eventlistings/
-    │   ├── yyyymmddevents.txt      e.g.  20110601events.txt
-    │   └── ...
-    └── Data Received/              ← output written here
-        ├── JUN_11XRA.txt
-        └── JUN_11FLA.txt
-```
-
-### Input file — fixed-width column layout
-
-| Cols (0-based) | Field              |
-|----------------|--------------------|
-| 11 – 16        | Start time         |
-| 17 – 23        | Peak time          |
-| 27 – 33        | End time           |
-| 43 – 47        | Event type (XRA / FLA) |
-| 58 – 64        | Strength / class   |
-
-### Output line format
-
-```
-MM DD     HHMMSS HHMMSS HHMMSS TYPE   CLASS
-└─ date ─┘└start┘└peak ┘└end  ┘└type┘└class┘
-```
-
-Events are sorted chronologically and separated by a blank line between days.
-
----
-
-## Imports
 
 ```{python}
 import glob
@@ -100,8 +50,8 @@ MONTH: str = "APR"          # Three-letter month, any case   e.g. "Jun", "JUN"
 YEAR:  str = "26"           # Two-digit year                 e.g. "11"
 
 # ── Base directory (used when INTERACTIVE = False) ───────────────────────────
-# Leave as empty string "" to use the current working directory.
-BASE_DIR: str = ""
+# Must be the directory that CONTAINS the MMM_YY folder (e.g. APR_26).
+BASE_DIR: str = r"C:/Users/Owner/Documents/SSN3_SIDROOT"
 
 # ── Event types to extract ───────────────────────────────────────────────────
 # Any subset of {"FLA", "XRA"}.  Order does not matter.
@@ -170,90 +120,7 @@ for sample in ["Jun11", "jun 11", "JUN...11", "jun_11"]:
 - **`output_base`** — the path stem to which `XRA.txt` / `FLA.txt` are appended
 
 ```{python}
-def get_file_paths(
-    month_year_func=None,
-    base_dir_func=None,
-) -> tuple[str, Path]:
-    """
-    Resolve the event-listings glob pattern and output base path.
-
-    In interactive mode the user is prompted; otherwise the values defined
-    in the Configuration section are used directly.
-
-    Parameters
-    ----------
-    month_year_func : callable, optional
-        Override for the month/year prompt (used in unit tests).
-    base_dir_func : callable, optional
-        Override for the base-directory prompt (used in unit tests).
-
-    Returns
-    -------
-    event_glob : str
-        Glob pattern for all daily event files, e.g.
-        '/data/JUN_11/eventlistings/*events.txt'
-    output_base : Path
-        Stem for output files, e.g. Path('/data/JUN_11/Data Received/JUN_11').
-        The caller appends the qualifier code and '.txt'.
-
-    Raises
-    ------
-    SystemExit
-        If the eventlistings directory does not exist.
-    """
-    if INTERACTIVE:
-        # ── Interactive branch ───────────────────────────────────────────────
-        _prompt_my = month_year_func or (
-            lambda: input(
-                "\n Enter 3-character month and 2-digit year "
-                "(any separator is fine):\n"
-                " Examples:  Jun11   Jun 11   Jun...11\n > "
-            )
-        )
-        _prompt_bd = base_dir_func or (
-            lambda label: input(
-                f"\n Path to the directory containing '{label}'"
-                f" [press Enter for current directory]: "
-            )
-        )
-        raw = _prompt_my()
-        try:
-            mmm, yy = _parse_month_year(raw)
-        except ValueError as exc:
-            sys.exit(f"\n Invalid date entry: {exc}\n")
-
-        period_label = f"{mmm}_{yy}"
-        raw_dir = _prompt_bd(period_label).strip()
-        base_dir = Path(raw_dir).expanduser() if raw_dir else Path.cwd()
-
-    else:
-        # ── Scripted branch ──────────────────────────────────────────────────
-        try:
-            mmm, yy = _parse_month_year(MONTH + YEAR)
-        except ValueError as exc:
-            sys.exit(f"\n Configuration error: {exc}\n")
-
-        period_label = f"{mmm}_{yy}"
-        base_dir = Path(BASE_DIR).expanduser() if BASE_DIR else Path.cwd()
-
-    period_dir   = base_dir / period_label
-    listings_dir = period_dir / "eventlistings"
-    output_dir   = period_dir / "Data Received"
-
-    # Validate source directory.
-    if not listings_dir.is_dir():
-        sys.exit(
-            f"\n Event listings directory not found:\n  {listings_dir}\n"
-            "  Check that the path and period label are correct.\n"
-        )
-
-    # Create output directory if absent.
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    event_glob  = str(listings_dir / "*events.txt")
-    output_base = output_dir / period_label
-
-    return event_glob, output_base
+def get_file_paths(    month_year_func=None,    base_dir_func=None,) -> tuple[str, Path]:    """    Resolve the event-listings glob pattern and output base path.    In interactive mode the user is prompted; otherwise the values defined    in the Configuration section are used directly.    Parameters    ----------    month_year_func : callable, optional        Override for the month/year prompt (used in unit tests).    base_dir_func : callable, optional        Override for the base-directory prompt (used in unit tests).    Returns    -------    event_glob : str        Glob pattern for all daily event files, e.g.        '/data/JUN_11/eventlistings/*events.txt'    output_base : Path        Stem for output files, e.g. Path('/data/JUN_11/Data Received/JUN_11').        The caller appends the qualifier code and '.txt'.    Raises    ------    FileNotFoundError        If the eventlistings directory does not exist.    """    if INTERACTIVE:        # ── Interactive branch ───────────────────────────────────────────────        _prompt_my = month_year_func or (            lambda: input(                "\n Enter 3-character month and 2-digit year "                "(any separator is fine):\n"                " Examples:  Jun11   Jun 11   Jun...11\n > "            )        )        _prompt_bd = base_dir_func or (            lambda label: input(                f"\n Path to the directory containing '{label}'"                f" [press Enter for current directory]: "            )        )        raw = _prompt_my()        try:            mmm, yy = _parse_month_year(raw)        except ValueError as exc:            raise ValueError(f"Invalid date entry: {exc}") from exc        period_label = f"{mmm}_{yy}"        raw_dir = _prompt_bd(period_label).strip()        base_dir = Path(raw_dir).expanduser() if raw_dir else Path.cwd()    else:        # ── Scripted branch ──────────────────────────────────────────────────        try:            mmm, yy = _parse_month_year(MONTH + YEAR)        except ValueError as exc:            raise ValueError(f"Configuration error: {exc}") from exc        period_label = f"{mmm}_{yy}"        base_dir = Path(BASE_DIR).expanduser() if BASE_DIR else Path.cwd()    period_dir   = base_dir / period_label    listings_dir = period_dir / "eventlistings"    output_dir   = period_dir / "Data Received"    # Diagnostic — always printed so paths are visible in the rendered output    print(f"  base_dir    : {base_dir}")    print(f"  period_dir  : {period_dir}")    print(f"  listings_dir: {listings_dir}  [{'EXISTS' if listings_dir.is_dir() else 'NOT FOUND'}]")    print(f"  output_dir  : {output_dir}")    # Validate source directory    if not listings_dir.is_dir():        raise FileNotFoundError(            f"Event listings directory not found:\n  {listings_dir}\n"            "Check that BASE_DIR, MONTH, and YEAR are correct."        )    # Create output directory if absent    output_dir.mkdir(parents=True, exist_ok=True)    event_glob  = str(listings_dir / "*events.txt")    output_base = output_dir / period_label    return event_glob, output_base
 ```
 
 ---
@@ -265,52 +132,7 @@ events).  In scripted mode the `QUAL_CODES` list from @sec-config is used
 directly; in interactive mode the user is prompted.
 
 ```{python}
-def get_event_qualifiers(input_func=None) -> list[str]:
-    """
-    Return the list of event-type codes to extract.
-
-    In interactive mode the user is prompted for a comma-separated list.
-    In scripted mode the QUAL_CODES variable from the Configuration section
-    is normalised and validated.
-
-    Parameters
-    ----------
-    input_func : callable, optional
-        Override for the qualifier prompt (used in unit tests).
-
-    Returns
-    -------
-    list[str]
-        Subset of ['FLA', 'XRA'] in canonical order.
-
-    Raises
-    ------
-    SystemExit
-        If no valid code is found.
-    """
-    VALID = {"FLA", "XRA"}
-
-    if INTERACTIVE:
-        _prompt = input_func or (
-            lambda: input(
-                "\n\n  Available event types: FLA  XRA\n"
-                "  Enter one or both, comma-separated (e.g.  XRA,FLA): "
-            )
-        )
-        raw    = _prompt().upper()
-        tokens = {t.strip() for t in raw.split(",")}
-    else:
-        tokens = {c.strip().upper() for c in QUAL_CODES}
-
-    codes = [c for c in ("FLA", "XRA") if c in tokens]
-
-    if not codes:
-        sys.exit(
-            "\n No valid event qualifiers found. "
-            "Please specify FLA, XRA, or both.\n"
-        )
-
-    return codes
+def get_event_qualifiers(input_func=None) -> list[str]:    """    Return the list of event-type codes to extract.    In interactive mode the user is prompted for a comma-separated list.    In scripted mode the QUAL_CODES variable from the Configuration section    is normalised and validated.    Parameters    ----------    input_func : callable, optional        Override for the qualifier prompt (used in unit tests).    Returns    -------    list[str]        Subset of ['FLA', 'XRA'] in canonical order.    Raises    ------    ValueError        If no valid code is found.    """    VALID = {"FLA", "XRA"}    if INTERACTIVE:        _prompt = input_func or (            lambda: input(                "\n\n  Available event types: FLA  XRA\n"                "  Enter one or both, comma-separated (e.g.  XRA,FLA): "            )        )        raw    = _prompt().upper()        tokens = {t.strip() for t in raw.split(",")}    else:        tokens = {c.strip().upper() for c in QUAL_CODES}    codes = [c for c in ("FLA", "XRA") if c in tokens]    if not codes:        raise ValueError(            "No valid event qualifiers found. "            "Please specify FLA, XRA, or both in QUAL_CODES."        )    return codes
 ```
 
 ### Smoke-test
@@ -553,3 +375,5 @@ import platform, sys as _sys
 print(f"Python : {_sys.version}")
 print(f"Platform: {platform.platform()}")
 ```
+
+

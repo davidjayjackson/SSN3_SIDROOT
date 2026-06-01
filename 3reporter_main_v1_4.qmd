@@ -416,7 +416,7 @@ class Observer:
                 f"Enter location for {self.id} (format: City, State): "
             )
 
-        config = configparser.RawConfigParser()
+        config = configparser.RawConfigParser(strict=False)
         config.optionxform = str
         config.read(observers_ini)
 
@@ -473,7 +473,7 @@ class Observer:
 
     def _get_station_info(self, station_code: str, stations_ini: str) -> str:
         """Return the frequency string for *station_code*, prompting if unknown."""
-        config = configparser.RawConfigParser()
+        config = configparser.RawConfigParser(strict=False)
         config.optionxform = str
         config.read(stations_ini)
 
@@ -868,7 +868,7 @@ def compute_unused_observer_events(
                     / (obs.qualCount + 1)
                 )
                 obs.qualCount += 1
-                config = configparser.RawConfigParser()
+                config = configparser.RawConfigParser(strict=False)
                 config.optionxform = str
                 config.read(observers_ini)
                 config.set("QUALITY RATING", obs.id, str(obs.quality))

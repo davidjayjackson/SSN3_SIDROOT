@@ -1,13 +1,13 @@
 ---
-title: "GOES / SID Analysis Tools"
-subtitle: "Processing Solar Flare Event Data with Python 3"
-author: "SID Analysis Project"
+title: GOES / SID Analysis Tools
+subtitle: Processing Solar Flare Event Data with Python 3
+author: SID Analysis Project
 date: today
 format:
   html:
     toc: true
     toc-depth: 3
-    toc-title: "Contents"
+    toc-title: Contents
     number-sections: true
     theme: cosmo
     code-fold: true
@@ -23,77 +23,8 @@ execute:
   echo: true
   warning: false
   message: false
+jupyter: python3
 ---
-
-## Overview
-
-This document describes the GOES/SID (Sudden Ionospheric Disturbance) analysis
-toolchain.  The pipeline processes raw solar flare event listings downloaded from
-NOAA/SWPC and correlates them with observer reports submitted to the AAVSO SID
-programme.
-
-The three main scripts run in order:
-
-| Step | Script | Purpose |
-|------|--------|---------|
-| 1 | `1goesevents.py` | Extract FLA and/or XRA events from raw GOES event listings |
-| 2 | `2goesSumm.py` | Summarise daily XRA flare-class counts into a CSV |
-| 3 | `3reporter_main.py` | Correlate observer SID reports with GOES events and generate output reports |
-
----
-
-## Directory Structure
-
-The scripts expect data to be arranged as follows:
-
-```
-<base_dir>/
-└── MMM_YY/                        ← e.g.  JUN_11
-    ├── eventlistings/
-    │   ├── yyyymmddEvents.txt     ← raw GOES daily event files
-    │   └── ...
-    └── Data Received/
-        ├── MMM_YYXRA.txt          ← output of Step 1 (XRA events)
-        ├── MMM_YYFLA.txt          ← output of Step 1 (FLA events)
-        ├── MMM_YYXRASumm2.csv     ← output of Step 2
-        └── *.dat                  ← observer SID report files
-```
-
----
-
-## Step 1 — Extract GOES Events (`1goesevents.py`)
-
-### What it does
-
-Reads every `*events.txt` file in the `eventlistings/` sub-directory for the
-chosen month and extracts lines matching the requested event qualifier(s)
-(`XRA`, `FLA`, or both).  Events are sorted chronologically and written to
-`MMM_YYXRA.txt` and/or `MMM_YYFLA.txt` in the `Data Received/` folder.
-
-### Input file format
-
-Each raw GOES event file is named `yyyymmddEvents.txt`.  The relevant fields
-are at fixed column positions:
-
-| Columns (0-indexed) | Content |
-|---------------------|---------|
-| 11–16 | Start time (HHMM) |
-| 17–23 | Maximum time |
-| 27–33 | End time |
-| 43–47 | Event qualifier (`XRA`, `FLA`, …) |
-| 58–64 | Flux / magnitude |
-
-### Usage
-
-```bash
-# Interactive (prompts for month/year and qualifier)
-python 1goesevents.py
-
-# With explicit output base name
-python 1goesevents.py -o ~/data/JUN_11/Data\ Received/JUN_11
-```
-
-### Key functions
 
 ```{python}
 #| eval: false
@@ -468,3 +399,6 @@ python 3reporter_main.py -d C:\Users\Owner\Documents\SSN3_SIDROOT
 #   > Minimum Quality Rating: 10
 #   (file picker opens — select observer .dat files)
 ```
+
+
+
